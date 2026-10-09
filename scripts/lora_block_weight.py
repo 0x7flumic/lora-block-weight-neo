@@ -12,8 +12,10 @@ Supports:
 import logging
 import os
 import json
+import math
 import re
 import struct
+import tempfile
 from typing import Optional, Dict, List
 
 import gradio as gr
@@ -73,6 +75,8 @@ _RE_FLUX_DBL = re.compile(r"double_blocks[._](\d+)[._]")
 _RE_FLUX_SNG = re.compile(r"single_blocks[._](\d+)[._]")
 
 _RE_BLOCKS = re.compile(r"blocks[._](\d+)[._]")
+# Explicitly match DiT transformer blocks while excluding LLM adapter and text encoder blocks
+_RE_DIT_BLOCKS = re.compile(r"(?<!llm_adapter\.)(?<!text_encoders\.)(?<!text_conditioner\.)\bblocks[._](\d+)[._]")
 
 
 # SD / SDXL (26 values: 0=BASE, 1-12=IN00-IN11, 13=M00, 14-25=OUT00-OUT11)
@@ -235,9 +239,16 @@ ANIMA_29B_PRESETS = {
     "TEXTURE":     ",".join(["0"] * 34 + ["1"] * 6),
 }
 
+# Canonical Anima block mappings from SD WebUI Neo backend/nn/anima.py
+ANIMA_BLOCK_MAPPINGS: Dict[tuple, List[int]] = {
+    (28, 40): [0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27],
+    (28, 52): [0, 1, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 7, 7, 7, 8, 9, 9, 9, 10, 11, 11, 11, 12, 13, 14, 14, 14, 15, 16, 16, 16, 17, 18, 18, 18, 19, 20, 20, 20, 21, 22, 22, 22, 23, 24, 24, 24, 25, 26, 27],
+    (40, 52): [0, 1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 17, 17, 18, 19, 20, 20, 21, 22, 23, 23, 24, 25, 26, 26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36, 37, 38, 39],
+}
+
 class AnimaProfile(ArchitectureProfile):
     def __init__(self, block_count=28):
-        disp = "Anima 2.9B" if block_count >= 40 else "Anima 2B"
+        disp = f"Anima ({block_count} Blocks)"
         presets = ANIMA_29B_PRESETS if block_count >= 40 else ANIMA_2B_PRESETS
         super().__init__(
             name=f"anima{block_count}",
@@ -245,10 +256,12 @@ class AnimaProfile(ArchitectureProfile):
             block_count=block_count,
             block_names={f"B{i:02d}": i for i in range(block_count)},
             presets=presets,
-            key_patterns=[_RE_BLOCKS]
+            key_patterns=[_RE_DIT_BLOCKS]
         )
     def get_block_index(self, key: str) -> Optional[int]:
-        m = _RE_BLOCKS.search(key)
+        if "llm_adapter" in key or "text_encoders" in key or "text_conditioner" in key:
+            return None
+        m = _RE_DIT_BLOCKS.search(key)
         return int(m.group(1)) if m else None
 
 
@@ -327,6 +340,7 @@ PROFILE_REGISTRY: Dict[str, ArchitectureProfile] = {
     "flux_k4b": FluxKlein4BProfile(),
     "anima28": AnimaProfile(28),
     "anima40": AnimaProfile(40),
+    "anima52": AnimaProfile(52),
     "wan21_14b": WanProfile(40),
     "wan21_13b": WanProfile(30),
     "qwen_image": QwenImageProfile(60),
@@ -352,21 +366,28 @@ def _load_user_presets():
                 data = json.load(f)
                 for k, v in data.items():
                     if k in PROFILE_REGISTRY and isinstance(v, dict):
-                        PROFILE_REGISTRY[k].presets.update(v)
+                        safe_v = {pk: pv for pk, pv in v.items() if pk.upper() not in {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}}
+                        PROFILE_REGISTRY[k].presets.update(safe_v)
                 if "sdxl" in data and "sd15" in PROFILE_REGISTRY:
-                    PROFILE_REGISTRY["sd15"].presets.update(data["sdxl"])
+                    safe_sdxl = {pk: pv for pk, pv in data["sdxl"].items() if pk.upper() not in {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}}
+                    PROFILE_REGISTRY["sd15"].presets.update(safe_sdxl)
                 if "flux" in data and "flux1" in PROFILE_REGISTRY:
-                    PROFILE_REGISTRY["flux1"].presets.update(data["flux"])
+                    safe_flux = {pk: pv for pk, pv in data["flux"].items() if pk.upper() not in {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}}
+                    PROFILE_REGISTRY["flux1"].presets.update(safe_flux)
                 if "anima" in data:
+                    safe_anima = {pk: pv for pk, pv in data["anima"].items() if pk.upper() not in {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}}
                     if "anima28" in PROFILE_REGISTRY:
-                        PROFILE_REGISTRY["anima28"].presets.update(data["anima"])
+                        PROFILE_REGISTRY["anima28"].presets.update(safe_anima)
                     if "anima40" in PROFILE_REGISTRY:
-                        PROFILE_REGISTRY["anima40"].presets.update(data["anima"])
+                        PROFILE_REGISTRY["anima40"].presets.update(safe_anima)
+                    if "anima52" in PROFILE_REGISTRY:
+                        PROFILE_REGISTRY["anima52"].presets.update(safe_anima)
                 if "wan" in data:
+                    safe_wan = {pk: pv for pk, pv in data["wan"].items() if pk.upper() not in {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}}
                     if "wan21_14b" in PROFILE_REGISTRY:
-                        PROFILE_REGISTRY["wan21_14b"].presets.update(data["wan"])
+                        PROFILE_REGISTRY["wan21_14b"].presets.update(safe_wan)
                     if "wan21_13b" in PROFILE_REGISTRY:
-                        PROFILE_REGISTRY["wan21_13b"].presets.update(data["wan"])
+                        PROFILE_REGISTRY["wan21_13b"].presets.update(safe_wan)
         except Exception as e:
             logger.error(f"[LBW] Failed to load user presets: {e}")
 
@@ -423,22 +444,30 @@ def detect_model_profile(patch_keys) -> ArchitectureProfile:
         return QwenImageProfile(num_blocks)
 
     # 4. Wan 2.1 vs Anima detection
-    is_wan = any("patch_embedding" in k or "time_projection" in k or "head." in k for k in keys_set)
+    is_wan = any("patch_embedding" in k or "time_projection" in k or "head." in k or "wan" in k.lower() for k in keys_set)
+    is_anima = any("adaln_modulation" in k or "llm_adapter" in k or "qwen" in k.lower() or "anima" in k.lower() for k in keys_set)
     block_max = -1
     for k in keys_set:
-        m = _RE_BLOCKS.search(k)
+        m = _RE_DIT_BLOCKS.search(k)
         if m:
             block_max = max(block_max, int(m.group(1)))
 
-    if is_wan:
+    if is_wan and not is_anima:
         num_blocks = block_max + 1 if block_max != -1 else 40
         return PROFILE_REGISTRY["wan21_14b"] if num_blocks >= 40 else PROFILE_REGISTRY["wan21_13b"]
 
     if block_max != -1:
         num_blocks = block_max + 1
-        if num_blocks > 28:
-            return PROFILE_REGISTRY["anima40"] if num_blocks <= 40 else AnimaProfile(num_blocks)
-        return PROFILE_REGISTRY["anima28"]
+        if num_blocks == 40 and not is_anima:
+            # Default 40-block DiT without Anima markers to Wan 14B
+            return PROFILE_REGISTRY["wan21_14b"]
+        if num_blocks == 28:
+            return PROFILE_REGISTRY["anima28"]
+        elif num_blocks == 40:
+            return PROFILE_REGISTRY["anima40"]
+        elif num_blocks == 52:
+            return PROFILE_REGISTRY["anima52"]
+        return AnimaProfile(num_blocks)
 
     return PROFILE_REGISTRY["sdxl"]
 
@@ -576,11 +605,16 @@ def detect_lora_arch_by_name(name: str) -> Optional[ArchitectureProfile]:
     if (profile is None or profile.name == "sdxl") and is_meta_anima:
         block_max = -1
         for k in keys:
-            m = _RE_BLOCKS.search(k)
+            m = _RE_DIT_BLOCKS.search(k)
             if m:
                 block_max = max(block_max, int(m.group(1)))
         total_blocks = block_max + 1 if block_max != -1 else 28
-        profile = PROFILE_REGISTRY["anima40"] if total_blocks > 28 else PROFILE_REGISTRY["anima28"]
+        if total_blocks == 52:
+            profile = PROFILE_REGISTRY["anima52"]
+        elif total_blocks >= 40:
+            profile = PROFILE_REGISTRY["anima40"]
+        else:
+            profile = PROFILE_REGISTRY["anima28"]
 
     if profile:
         _detected_arch_cache[name] = profile.name
@@ -592,6 +626,10 @@ def adapt_block_weights(weights: List[float], target_len: int, arch: str = "sd")
     src_len = len(weights)
     if src_len == target_len:
         return weights
+
+    # Single-element vector broadcasting: e.g. [0.5] -> [0.5] * target_len
+    if src_len == 1 and target_len > 1:
+        return [weights[0]] * target_len
 
     # SD 17-block to 26-block expansion
     if src_len == 17 and target_len == 26 and "sd" in arch:
@@ -617,6 +655,13 @@ def adapt_block_weights(weights: List[float], target_len: int, arch: str = "sd")
             return dbl_src[:8] + sng_src[:24]
         if target_len == 25:  # 5 dbl + 20 sng
             return dbl_src[:5] + sng_src[:20]
+
+    # Anima canonical block mapping
+    if "anima" in arch and (src_len, target_len) in ANIMA_BLOCK_MAPPINGS:
+        mapping = ANIMA_BLOCK_MAPPINGS[(src_len, target_len)]
+        return [weights[src_idx] for src_idx in mapping]
+
+    logger.warning(f"[LBW] Block count mismatch ({src_len} != {target_len}) for arch '{arch}'. Resampling weights.")
 
     # Linear interpolation for continuous architectures (Anima, Wan)
     if src_len > 1 and target_len > 1:
@@ -664,15 +709,22 @@ def parse_block_weights(raw_str: str, profile: Optional[ArchitectureProfile] = N
     if upper in LEGACY_PRESET_ALIASES:
         upper = LEGACY_PRESET_ALIASES[upper]
 
-    # 1. Preset lookup
-    if upper in profile.presets:
-        return [float(x.strip()) for x in profile.presets[upper].split(",")]
+    # 1. Preset lookup (case-insensitive)
+    for p_name, p_vec in profile.presets.items():
+        if p_name.upper() == upper:
+            vec = [float(x.strip()) for x in p_vec.split(",")]
+            if any(math.isnan(v) or math.isinf(v) for v in vec):
+                return None
+            return vec
 
-    # 2. Check other profiles presets (cross-preset fallback)
+    # 2. Check other profiles presets (cross-preset fallback, case-insensitive)
     for p in PROFILE_REGISTRY.values():
-        if upper in p.presets:
-            vec = [float(x.strip()) for x in p.presets[upper].split(",")]
-            return adapt_block_weights(vec, profile.block_count, arch=profile.name)
+        for p_name, p_vec in p.presets.items():
+            if p_name.upper() == upper:
+                vec = [float(x.strip()) for x in p_vec.split(",")]
+                if any(math.isnan(v) or math.isinf(v) for v in vec):
+                    return None
+                return adapt_block_weights(vec, profile.block_count, arch=profile.name)
 
     # 3. Single block alias
     result = profile.resolve_block_name(upper)
@@ -683,6 +735,9 @@ def parse_block_weights(raw_str: str, profile: Optional[ArchitectureProfile] = N
     parts = raw_str.split(",")
     try:
         parsed = [float(x.strip()) for x in parts]
+        if any(math.isnan(v) or math.isinf(v) for v in parsed):
+            logger.warning(f"[LBW] Could not parse block weights (NaN or Inf encountered): {raw_str}")
+            return None
         return adapt_block_weights(parsed, profile.block_count, arch=profile.name)
     except ValueError:
         logger.warning(f"[LBW] Could not parse block weights: {raw_str}")
@@ -702,7 +757,7 @@ def _is_block_weight_string(val) -> bool:
     if val_upper in LEGACY_PRESET_ALIASES:
         return True
     for prof in PROFILE_REGISTRY.values():
-        if val_upper in prof.presets or val_upper in prof.block_names:
+        if any(pk.upper() == val_upper for pk in prof.presets) or val_upper in prof.block_names:
             return True
     return False
 
@@ -740,7 +795,10 @@ def _install_patches():
         return
 
     try:
-        import networks as networks_module
+        try:
+            import networks as networks_module
+        except ImportError:
+            from extensions_builtin.sd_forge_lora import networks as networks_module
         if _original_load_lora is None:
             _original_load_lora = networks_module.load_lora_for_models
             networks_module.load_lora_for_models = _patched_load_lora_for_models
@@ -848,10 +906,11 @@ def resolve_lora_weights(lora_basename: str, filename: str, active_weights: Dict
     if lora_basename in active_weights:
         return active_weights[lora_basename]
 
-    # Step 3: Case-insensitive exact name match
+    # Step 3: Case-insensitive match & basename match (handling subfolder paths / and \)
     lower = lora_basename.lower()
     for name, weights in active_weights.items():
-        if name.lower() == lower:
+        name_clean = os.path.splitext(os.path.basename(name.replace("\\", "/")))[0].lower()
+        if name.lower() == lower or name_clean == lower:
             return weights
 
     return None
@@ -944,7 +1003,7 @@ def _patched_load_lora_for_models(model, clip, lora, strength_model, strength_cl
                     patches[i] = (pt[0] * scale, *pt[1:])
                     scaled_count += 1
 
-        # 2. Scale Text Encoder (CLIP) patches using BASE weight
+        # 2. Scale Text Encoder (CLIP / Qwen3 / T5) patches using BASE weight
         new_clip_patcher = _get_patcher(new_clip)
         if new_clip_patcher is not None and len(block_weights) > 0:
             base_scale = float(block_weights[0])
@@ -975,16 +1034,22 @@ def _patched_load_lora_for_models(model, clip, lora, strength_model, strength_cl
 #  UI & Gradio Controls
 # ═══════════════════════════════════════════════════════════
 
+# Built-in presets protected against deletion
+BUILTIN_PRESET_NAMES = {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}
+
 def _save_preset_internal(prof_key: str, name: str, weights_str: str) -> bool:
-    """Save preset to USER_PRESETS_FILE and reload engine state."""
+    """Save preset to USER_PRESETS_FILE atomically and reload engine state."""
     try:
         data = {}
         if os.path.exists(USER_PRESETS_FILE):
             with open(USER_PRESETS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
         data.setdefault(prof_key, {})[name] = weights_str.strip()
-        with open(USER_PRESETS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
+        dir_name = os.path.dirname(USER_PRESETS_FILE)
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            json.dump(data, tf, indent=4)
+            temp_path = tf.name
+        os.replace(temp_path, USER_PRESETS_FILE)
         _load_user_presets()
         return True
     except Exception as e:
@@ -993,43 +1058,59 @@ def _save_preset_internal(prof_key: str, name: str, weights_str: str) -> bool:
 
 
 def _delete_preset_internal(prof_key: str, name: str) -> bool:
-    """Delete preset from USER_PRESETS_FILE and reload engine state."""
+    """Delete preset from USER_PRESETS_FILE atomically and reload engine state."""
     try:
+        if name.upper() in BUILTIN_PRESET_NAMES:
+            logger.warning(f"[LBW] Cannot delete protected built-in preset '{name}'")
+            return False
+
         if not os.path.exists(USER_PRESETS_FILE):
             return True
         with open(USER_PRESETS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         
-        # Remove from prof_key if present
+        # Remove from prof_key if present (case-insensitive)
         removed = False
-        if prof_key in data and name in data[prof_key]:
-            del data[prof_key][name]
-            removed = True
+        target_name_lower = name.strip().lower()
+        if prof_key in data:
+            keys_to_del = [k for k in data[prof_key] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data[prof_key][k]
+                removed = True
         
         # Also clean aliases if applicable
-        if prof_key in ("anima28", "anima40") and "anima" in data and name in data["anima"]:
-            del data["anima"][name]
-            removed = True
-        if prof_key in ("wan21_14b", "wan21_13b") and "wan" in data and name in data["wan"]:
-            del data["wan"][name]
-            removed = True
+        if prof_key in ("anima28", "anima40", "anima52") and "anima" in data:
+            keys_to_del = [k for k in data["anima"] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data["anima"][k]
+                removed = True
+        if prof_key in ("wan21_14b", "wan21_13b") and "wan" in data:
+            keys_to_del = [k for k in data["wan"] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data["wan"][k]
+                removed = True
             
         if removed:
-            with open(USER_PRESETS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+            dir_name = os.path.dirname(USER_PRESETS_FILE)
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                json.dump(data, tf, indent=4)
+                temp_path = tf.name
+            os.replace(temp_path, USER_PRESETS_FILE)
         
         # Reset profile preset dictionaries and reload
         keys_to_clean = [prof_key]
-        if prof_key in ("anima28", "anima40"):
-            keys_to_clean.extend(["anima28", "anima40"])
+        if prof_key in ("anima28", "anima40", "anima52"):
+            keys_to_clean.extend(["anima28", "anima40", "anima52"])
         elif prof_key in ("wan21_14b", "wan21_13b"):
             keys_to_clean.extend(["wan21_14b", "wan21_13b"])
         elif prof_key in ("sdxl", "sd15"):
             keys_to_clean.extend(["sdxl", "sd15"])
 
         for k in set(keys_to_clean):
-            if k in PROFILE_REGISTRY and name in PROFILE_REGISTRY[k].presets:
-                del PROFILE_REGISTRY[k].presets[name]
+            if k in PROFILE_REGISTRY:
+                to_del = [pk for pk in PROFILE_REGISTRY[k].presets if pk.lower() == target_name_lower]
+                for pk in to_del:
+                    del PROFILE_REGISTRY[k].presets[pk]
 
         _load_user_presets()
         return True
@@ -1090,6 +1171,8 @@ try:
                     prof_key = "anima28"
                 elif arch == "anima40":
                     prof_key = "anima40"
+                elif arch == "anima52":
+                    prof_key = "anima52"
                 elif arch in ("flux", "flux1"):
                     prof_key = "flux1"
                 elif arch in ("flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
@@ -1116,6 +1199,8 @@ try:
                     prof_key = "anima28"
                 elif arch == "anima40":
                     prof_key = "anima40"
+                elif arch == "anima52":
+                    prof_key = "anima52"
                 elif arch in ("flux", "flux1"):
                     prof_key = "flux1"
                 elif arch in ("flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
@@ -1156,7 +1241,7 @@ class LoraBlockWeight(scripts.Script):
             "* **SD 1.5 & SDXL (26):** `BASE`, `IN00-IN11`, `M00`, `OUT00-OUT11`\n"
             "* **Flux.1 (57):** `D00-D18` (double), `S00-S37` (single)\n"
             "* **Flux.2-Klein 9B (32) / 4B (25):** `D00-D07` / `D00-D04` (double), `S00-S23` / `S00-S19` (single)\n"
-            "* **Anima 2B (28) / 2.9B (40):** `B00-B27` / `B00-B39`\n"
+            "* **Anima 2B (28) / 2.9B (40) / 3.8B (52):** `B00-B27` (Base) / `B00-B39` / `B00-B51` (Host Mapped)\n"
             "* **Wan 2.1-14B (40) / 1.3B (30):** `B00-B39` / `B00-B29`\n"
             "* **Qwen-Image (60):** `B00-B59`"
         )

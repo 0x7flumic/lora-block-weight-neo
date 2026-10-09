@@ -88,6 +88,17 @@
                 TEXTURE:     [...Array(34).fill("0"), ...Array(6).fill("1")].join(",")
             }
         },
+        anima52: {
+            label: "Anima 3.8B (52)",
+            count: 52,
+            names: Array.from({length: 52}, (_, i) => `B${String(i).padStart(2, '0')}`),
+            presets: {
+                COMPOSITION: [...Array(13).fill("1"), ...Array(39).fill("0")].join(","),
+                FACE:        [...Array(13).fill("0"), ...Array(21).fill("1"), ...Array(18).fill("0")].join(","),
+                STYLE:       [...Array(26).fill("0"), ...Array(26).fill("1")].join(","),
+                TEXTURE:     [...Array(44).fill("0"), ...Array(8).fill("1")].join(",")
+            }
+        },
         wan21_14b: {
             label: "Wan 2.1-14B (40)",
             count: 40,
@@ -165,7 +176,8 @@
             if (card) {
                 const cardText = (card.innerText || "").toLowerCase();
                 let detected = null;
-                if (cardText.includes("anima 2.9b") || cardText.includes("anima-2.9b") || cardText.includes("anima 40")) detected = "anima40";
+                if (cardText.includes("anima 52") || cardText.includes("anima-52") || cardText.includes("anima 3.8b") || cardText.includes("anima-3.8b")) detected = "anima52";
+                else if (cardText.includes("anima 2.9b") || cardText.includes("anima-2.9b") || cardText.includes("anima 40")) detected = "anima40";
                 else if (cardText.includes("anima 2b") || cardText.includes("anima-2b") || cardText.includes("anima 28")) detected = "anima28";
                 else if (cardText.includes("anima")) detected = "anima28";
                 else if (cardText.includes("flux 9b") || cardText.includes("klein 9b")) detected = "flux_k9b";
@@ -193,10 +205,11 @@
                 const data = await res.json();
                 const metaStr = (typeof data.metadata === "string" ? data.metadata : JSON.stringify(data.metadata || "")).toLowerCase();
                 let detected = null;
-                if (metaStr.includes("anima 2.9b") || metaStr.includes("anima-2.9b") || metaStr.includes("anima2.9b")) detected = "anima40";
+                if (metaStr.includes("anima 52") || metaStr.includes("anima-52") || metaStr.includes("anima 3.8b") || metaStr.includes("anima-3.8b") || metaStr.includes("blocks.51")) detected = "anima52";
+                else if (metaStr.includes("anima 2.9b") || metaStr.includes("anima-2.9b") || metaStr.includes("anima2.9b") || metaStr.includes("blocks.39")) detected = "anima40";
                 else if (metaStr.includes("anima 2b") || metaStr.includes("anima-2b") || metaStr.includes("anima2b")) detected = "anima28";
                 else if (metaStr.includes("anima")) {
-                    detected = (metaStr.includes("blocks.3") || metaStr.includes("blocks.28")) ? "anima40" : "anima28";
+                    detected = (metaStr.includes("blocks.5") || metaStr.includes("blocks.4")) ? "anima52" : ((metaStr.includes("blocks.3") || metaStr.includes("blocks.28")) ? "anima40" : "anima28");
                 } else if (metaStr.includes("flux") && (metaStr.includes("9b") || metaStr.includes("klein"))) detected = "flux_k9b";
                 else if (metaStr.includes("flux") && metaStr.includes("4b")) detected = "flux_k4b";
                 else if (metaStr.includes("flux")) detected = "flux1";
@@ -220,7 +233,8 @@
                 ckptText = (ckptSelect.value || ckptSelect.textContent || "").toLowerCase();
             }
             let detected = null;
-            if (ckptText.includes("anima 2.9b") || ckptText.includes("anima-2.9b")) detected = "anima40";
+            if (ckptText.includes("anima 52") || ckptText.includes("anima 3.8b") || ckptText.includes("anima-3.8b")) detected = "anima52";
+            else if (ckptText.includes("anima 2.9b") || ckptText.includes("anima-2.9b") || ckptText.includes("anima 40")) detected = "anima40";
             else if (ckptText.includes("anima")) detected = "anima28";
             else if (ckptText.includes("flux") && (ckptText.includes("klein") || ckptText.includes("9b"))) detected = "flux_k9b";
             else if (ckptText.includes("flux") && ckptText.includes("4b")) detected = "flux_k4b";
@@ -535,7 +549,10 @@
             // Distinct orange color matching the style of built-in presets
             btn.style.setProperty("--badge-color", "#f59e0b");
             btn.title = `Custom: ${customName}`;
-            btn.innerHTML = `<span class="lbw-badge-dot"></span>${customName}`;
+            const dot = document.createElement("span");
+            dot.className = "lbw-badge-dot";
+            btn.appendChild(dot);
+            btn.appendChild(document.createTextNode(customName));
             btn.addEventListener("click", () => applyPreset(customName, archPresets[customName]));
             container.appendChild(btn);
         });
@@ -905,7 +922,9 @@
                 lbw = p.substring(4);
             } else if (!isNaN(parseFloat(p)) && weight === null) {
                 weight = parseFloat(p);
-            } else if (p.includes(",") || ["COMPOSITION", "FACE", "STYLE", "TEXTURE", "MIDD", "INS", "OUTS"].includes(p.toUpperCase())) {
+            } else if (p.includes(",") || ["COMPOSITION", "FACE", "STYLE", "TEXTURE", "MIDD", "INS", "OUTS", "RESET"].includes(p.toUpperCase())) {
+                lbw = p;
+            } else if (i >= 2 && isNaN(parseFloat(p))) {
                 lbw = p;
             }
         }
