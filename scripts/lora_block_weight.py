@@ -1,12 +1,12 @@
 """
 LoRA Block Weight Extension for ForgeNEO
-Allows per-block weight control of LoRA models.
+Allows per-block weight control of LoRA models across SD, Flux, Anima, Wan, and Qwen-Image.
 
 Supports:
-  - Inline syntax:  <lora:name:1:lbw=1,0,0,...>   (named param, safe)
-  - Inline syntax:  <lora:name:1:lbw=MIDD>         (preset name)
-  - Positional:     <lora:name:1:1,0,0,...>         (monkeypatched to prevent crash)
-  - UI panel with preset selector, weight editor, and profile management
+  - Inline syntax:  <lora:name:1:lbw=FACE>         (preset name)
+  - Inline syntax:  <lora:name:1:lbw=1,0,0,...>    (named block vector)
+  - Positional:     <lora:name:1:1,0,0,...>        (positional block vector)
+  - Interactive in-prompt popover with real-time sliders and preset management
 """
 
 import logging
@@ -16,9 +16,7 @@ import math
 import re
 import struct
 import tempfile
-from typing import Optional, Dict, List
-
-import gradio as gr
+from typing import Optional, Dict, List, Any
 
 import modules.scripts as scripts
 from modules import shared
@@ -77,6 +75,73 @@ _RE_FLUX_SNG = re.compile(r"single_blocks[._](\d+)[._]")
 _RE_BLOCKS = re.compile(r"blocks[._](\d+)[._]")
 # Explicitly match DiT transformer blocks while excluding LLM adapter and text encoder blocks
 _RE_DIT_BLOCKS = re.compile(r"(?<!llm_adapter\.)(?<!text_encoders\.)(?<!text_conditioner\.)\bblocks[._](\d+)[._]")
+
+
+# Canonical Anima block mappings from SD WebUI Neo backend/nn/anima.py
+ANIMA_BLOCK_MAPPINGS: Dict[tuple, List[int]] = {
+    (28, 40): [0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27],
+    (28, 52): [0, 1, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 7, 7, 7, 8, 9, 9, 9, 10, 11, 11, 11, 12, 13, 14, 14, 14, 15, 16, 16, 16, 17, 18, 18, 18, 19, 20, 20, 20, 21, 22, 22, 22, 23, 24, 24, 24, 25, 26, 27],
+    (40, 52): [0, 1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 17, 17, 18, 19, 20, 20, 21, 22, 23, 23, 24, 25, 26, 26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36, 37, 38, 39],
+}
+
+def adapt_block_weights(weights: List[float], target_len: int, arch: str = "sd") -> List[float]:
+    """Adapt or interpolate weight vectors to match target block length."""
+    src_len = len(weights)
+    if src_len == target_len:
+        return weights
+
+    # Single-element vector broadcasting: e.g. [0.5] -> [0.5] * target_len
+    if src_len == 1 and target_len > 1:
+        return [weights[0]] * target_len
+
+    # SD 17-block to 26-block expansion
+    if src_len == 17 and target_len == 26 and "sd" in arch:
+        indices_17 = [0, 2, 3, 5, 6, 8, 9, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        expanded = [weights[0]] * 26
+        for val, idx in zip(weights, indices_17):
+            expanded[idx] = val
+        return expanded
+
+    # SDXL 12-block to 26-block expansion
+    if src_len == 12 and target_len == 26 and "sd" in arch:
+        indices_12 = [0, 5, 6, 8, 9, 13, 14, 15, 16, 17, 18, 19]
+        expanded = [weights[0]] * 26
+        for val, idx in zip(weights, indices_12):
+            expanded[idx] = val
+        return expanded
+
+    # Flux 57-block adapt to Klein
+    if src_len == 57 and "flux" in arch:
+        dbl_src = weights[:19]
+        sng_src = weights[19:57]
+        if target_len == 32:  # 8 dbl + 24 sng
+            return dbl_src[:8] + sng_src[:24]
+        if target_len == 25:  # 5 dbl + 20 sng
+            return dbl_src[:5] + sng_src[:20]
+
+    # Anima canonical block mapping
+    if "anima" in arch and (src_len, target_len) in ANIMA_BLOCK_MAPPINGS:
+        mapping = ANIMA_BLOCK_MAPPINGS[(src_len, target_len)]
+        return [weights[src_idx] for src_idx in mapping]
+
+    logger.warning(f"[LBW] Block count mismatch ({src_len} != {target_len}) for arch '{arch}'. Resampling weights.")
+
+    # Linear interpolation for continuous architectures (Anima, Wan)
+    if src_len > 1 and target_len > 1:
+        resampled = []
+        for i in range(target_len):
+            src_pos = i * (src_len - 1) / (target_len - 1)
+            lower = int(src_pos)
+            upper = min(lower + 1, src_len - 1)
+            frac = src_pos - lower
+            val = (1.0 - frac) * weights[lower] + frac * weights[upper]
+            resampled.append(val)
+        return resampled
+
+    # Fallback pad or slice
+    if src_len < target_len:
+        return weights + [1.0] * (target_len - src_len)
+    return weights[:target_len]
 
 
 # SD / SDXL (26 values: 0=BASE, 1-12=IN00-IN11, 13=M00, 14-25=OUT00-OUT11)
@@ -223,33 +288,26 @@ class FluxKlein4BProfile(ArchitectureProfile):
         return None
 
 
-# Anima 2B (28 blocks: B00-B27)
-ANIMA_2B_PRESETS = {
+# Anima (Canonical 28 blocks: B00-B27, mapped canonically to 40/52)
+ANIMA_PRESETS = {
     "COMPOSITION": ",".join(["1"] * 7 + ["0"] * 21),
     "FACE":        ",".join(["0"] * 7 + ["1"] * 11 + ["0"] * 10),
     "STYLE":       ",".join(["0"] * 14 + ["1"] * 14),
     "TEXTURE":     ",".join(["0"] * 24 + ["1"] * 4),
 }
 
-# Anima 2.9B (40 blocks: B00-B39)
-ANIMA_29B_PRESETS = {
-    "COMPOSITION": ",".join(["1"] * 10 + ["0"] * 30),
-    "FACE":        ",".join(["0"] * 10 + ["1"] * 16 + ["0"] * 14),
-    "STYLE":       ",".join(["0"] * 20 + ["1"] * 20),
-    "TEXTURE":     ",".join(["0"] * 34 + ["1"] * 6),
-}
-
-# Canonical Anima block mappings from SD WebUI Neo backend/nn/anima.py
-ANIMA_BLOCK_MAPPINGS: Dict[tuple, List[int]] = {
-    (28, 40): [0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27],
-    (28, 52): [0, 1, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 7, 7, 7, 8, 9, 9, 9, 10, 11, 11, 11, 12, 13, 14, 14, 14, 15, 16, 16, 16, 17, 18, 18, 18, 19, 20, 20, 20, 21, 22, 22, 22, 23, 24, 24, 24, 25, 26, 27],
-    (40, 52): [0, 1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 17, 17, 18, 19, 20, 20, 21, 22, 23, 23, 24, 25, 26, 26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36, 37, 38, 39],
-}
-
 class AnimaProfile(ArchitectureProfile):
     def __init__(self, block_count=28):
         disp = f"Anima ({block_count} Blocks)"
-        presets = ANIMA_29B_PRESETS if block_count >= 40 else ANIMA_2B_PRESETS
+        if block_count == 28:
+            presets = dict(ANIMA_PRESETS)
+        else:
+            presets = {
+                k: ",".join(str(int(v) if v.is_integer() else v) for v in adapt_block_weights(
+                    [float(x) for x in vec.split(",")], block_count, arch="anima"
+                ))
+                for k, vec in ANIMA_PRESETS.items()
+            }
         super().__init__(
             name=f"anima{block_count}",
             display_name=disp,
@@ -621,66 +679,6 @@ def detect_lora_arch_by_name(name: str) -> Optional[ArchitectureProfile]:
     return profile
 
 
-def adapt_block_weights(weights: List[float], target_len: int, arch: str = "sd") -> List[float]:
-    """Adapt or interpolate weight vectors to match target block length."""
-    src_len = len(weights)
-    if src_len == target_len:
-        return weights
-
-    # Single-element vector broadcasting: e.g. [0.5] -> [0.5] * target_len
-    if src_len == 1 and target_len > 1:
-        return [weights[0]] * target_len
-
-    # SD 17-block to 26-block expansion
-    if src_len == 17 and target_len == 26 and "sd" in arch:
-        indices_17 = [0, 2, 3, 5, 6, 8, 9, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25]
-        expanded = [weights[0]] * 26
-        for val, idx in zip(weights, indices_17):
-            expanded[idx] = val
-        return expanded
-
-    # SDXL 12-block to 26-block expansion
-    if src_len == 12 and target_len == 26 and "sd" in arch:
-        indices_12 = [0, 5, 6, 8, 9, 13, 14, 15, 16, 17, 18, 19]
-        expanded = [weights[0]] * 26
-        for val, idx in zip(weights, indices_12):
-            expanded[idx] = val
-        return expanded
-
-    # Flux 57-block adapt to Klein
-    if src_len == 57 and "flux" in arch:
-        dbl_src = weights[:19]
-        sng_src = weights[19:57]
-        if target_len == 32:  # 8 dbl + 24 sng
-            return dbl_src[:8] + sng_src[:24]
-        if target_len == 25:  # 5 dbl + 20 sng
-            return dbl_src[:5] + sng_src[:20]
-
-    # Anima canonical block mapping
-    if "anima" in arch and (src_len, target_len) in ANIMA_BLOCK_MAPPINGS:
-        mapping = ANIMA_BLOCK_MAPPINGS[(src_len, target_len)]
-        return [weights[src_idx] for src_idx in mapping]
-
-    logger.warning(f"[LBW] Block count mismatch ({src_len} != {target_len}) for arch '{arch}'. Resampling weights.")
-
-    # Linear interpolation for continuous architectures (Anima, Wan)
-    if src_len > 1 and target_len > 1:
-        resampled = []
-        for i in range(target_len):
-            src_pos = i * (src_len - 1) / (target_len - 1)
-            lower = int(src_pos)
-            upper = min(lower + 1, src_len - 1)
-            frac = src_pos - lower
-            val = (1.0 - frac) * weights[lower] + frac * weights[upper]
-            resampled.append(val)
-        return resampled
-
-    # Fallback pad or slice
-    if src_len < target_len:
-        return weights + [1.0] * (target_len - src_len)
-    return weights[:target_len]
-
-
 # Legacy preset alias mappings for backward compatibility
 LEGACY_PRESET_ALIASES: Dict[str, str] = {
     "MIDD": "FACE",
@@ -765,7 +763,6 @@ def _is_block_weight_string(val) -> bool:
 # ═══════════════════════════════════════════════════════════
 #  Global State
 # ═══════════════════════════════════════════════════════════
-_extension_enabled = False
 _active_block_weights = {}
 _last_lbw_state = None
 
@@ -849,7 +846,7 @@ def _patched_activate(self, p, params_list):
         params.positional = clean_positional
         params.items = params.positional + [f"{k}={v}" for k, v in params.named.items()]
 
-        if block_weight_str and _extension_enabled:
+        if block_weight_str:
             _active_block_weights[name] = block_weight_str
             logger.info(f"[LBW] {name}: queued block weight string '{block_weight_str}'")
 
@@ -1031,7 +1028,7 @@ def _patched_load_lora_for_models(model, clip, lora, strength_model, strength_cl
 
 
 # ═══════════════════════════════════════════════════════════
-#  UI & Gradio Controls
+#  Preset Management & API
 # ═══════════════════════════════════════════════════════════
 
 # Built-in presets protected against deletion
@@ -1119,6 +1116,17 @@ def _delete_preset_internal(prof_key: str, name: str) -> bool:
         return False
 
 
+def _normalize_arch_key(arch: str) -> str:
+    """Normalize input architecture name to internal profile key."""
+    if arch in ("anima", "anima28"):
+        return "anima28"
+    if arch in ("flux", "flux1"):
+        return "flux1"
+    if arch in ("anima40", "anima52", "flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
+        return arch
+    return "sdxl"
+
+
 def _get_all_presets_dict() -> Dict[str, Dict[str, str]]:
     """Return all presets grouped by architecture."""
     out = {}
@@ -1133,7 +1141,9 @@ try:
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
-    def _on_app_started(demo: Optional[gr.Blocks], app: FastAPI):
+    def _on_app_started(demo: Optional[Any], app: FastAPI):
+        _install_patches()
+
         @app.get("/lbw/api/presets")
         async def api_get_presets():
             return JSONResponse({"presets": _get_all_presets_dict()})
@@ -1166,20 +1176,7 @@ try:
                 if not name or not weights:
                     return JSONResponse({"success": False, "error": "Name and weights are required"}, status_code=400)
                 
-                # Map arch to profile key
-                if arch in ("anima", "anima28"):
-                    prof_key = "anima28"
-                elif arch == "anima40":
-                    prof_key = "anima40"
-                elif arch == "anima52":
-                    prof_key = "anima52"
-                elif arch in ("flux", "flux1"):
-                    prof_key = "flux1"
-                elif arch in ("flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
-                    prof_key = arch
-                else:
-                    prof_key = "sdxl"
-
+                prof_key = _normalize_arch_key(arch)
                 success = _save_preset_internal(prof_key, name, weights)
                 return JSONResponse({"success": success, "presets": _get_all_presets_dict()})
             except Exception as e:
@@ -1194,20 +1191,7 @@ try:
                 if not name:
                     return JSONResponse({"success": False, "error": "Preset name is required"}, status_code=400)
 
-                # Map arch to profile key
-                if arch in ("anima", "anima28"):
-                    prof_key = "anima28"
-                elif arch == "anima40":
-                    prof_key = "anima40"
-                elif arch == "anima52":
-                    prof_key = "anima52"
-                elif arch in ("flux", "flux1"):
-                    prof_key = "flux1"
-                elif arch in ("flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
-                    prof_key = arch
-                else:
-                    prof_key = "sdxl"
-
+                prof_key = _normalize_arch_key(arch)
                 success = _delete_preset_internal(prof_key, name)
                 return JSONResponse({"success": success, "presets": _get_all_presets_dict()})
             except Exception as e:
@@ -1226,42 +1210,13 @@ class LoraBlockWeight(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        try:
-            from modules.ui_components import InputAccordion
-            acc_context = InputAccordion(False, label="LoRA Block Weight Neo", elem_id=self.elem_id("enable"))
-        except Exception:
-            acc_context = None
+        return []
 
-        markdown_info = (
-            "**How to use:** Left-click or place cursor inside any `<lora:name:...>` tag in your prompt to open the floating menu to configure presets, adjust block sliders, and manage custom weights.\n\n"
-            "**Prompt Syntax:** `<lora:name:weight:lbw=preset_or_vector>`\n\n"
-            "* **Built-in Presets:** `COMPOSITION`, `FACE`, `STYLE`, `TEXTURE`, `RESET`\n"
-            "* **Direct Block Vector:** Comma-separated floats (e.g. `1,1,0,0,...`)\n\n"
-            "**Supported Architectures:**\n"
-            "* **SD 1.5 & SDXL (26):** `BASE`, `IN00-IN11`, `M00`, `OUT00-OUT11`\n"
-            "* **Flux.1 (57):** `D00-D18` (double), `S00-S37` (single)\n"
-            "* **Flux.2-Klein 9B (32) / 4B (25):** `D00-D07` / `D00-D04` (double), `S00-S23` / `S00-S19` (single)\n"
-            "* **Anima 2B (28) / 2.9B (40) / 3.8B (52):** `B00-B27` (Base) / `B00-B39` / `B00-B51` (Host Mapped)\n"
-            "* **Wan 2.1-14B (40) / 1.3B (30):** `B00-B39` / `B00-B29`\n"
-            "* **Qwen-Image (60):** `B00-B59`"
-        )
-
-        if acc_context is not None:
-            with acc_context as enabled:
-                gr.Markdown(markdown_info)
-        else:
-            with gr.Accordion("LoRA Block Weight Neo", open=False):
-                enabled = gr.Checkbox(label="Enable LoRA Block Weight", value=False)
-                gr.Markdown(markdown_info)
-
-        return [enabled]
-
-    def process(self, p, enabled, *args, **kwargs):
-        global _extension_enabled, _active_block_weights
-        _extension_enabled = bool(enabled)
+    def process(self, p, *args, **kwargs):
+        global _active_block_weights
         _active_block_weights.clear()
         _install_patches()
 
-    def postprocess(self, p, processed, *args):
+    def postprocess(self, p, processed, *args, **kwargs):
         global _active_block_weights
         _active_block_weights.clear()

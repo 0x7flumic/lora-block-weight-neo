@@ -4,7 +4,7 @@
  * Appears when the user left-clicks or places the caret inside a <lora:NAME:...> token.
  * Provides:
  *  - Automatic LoRA architecture detection from Extra Networks metadata
- *  - Architecture switcher with distinct Anima 2B (28) and Anima 2.9B (40)
+ *  - Architecture switcher with SD/XL, Flux.1, Klein 9B/4B, Anima (28/40/52), Wan, Qwen-Image
  *  - Quick-select functional preset badges without resetting LoRA weight
  *  - Interactive block chips / custom block weight editor for all blocks
  *  - Real-time in-prompt synchronization with Forge token counters
@@ -81,23 +81,39 @@
             label: "Anima 2.9B (40)",
             count: 40,
             names: Array.from({length: 40}, (_, i) => `B${String(i).padStart(2, '0')}`),
-            presets: {
-                COMPOSITION: [...Array(10).fill("1"), ...Array(30).fill("0")].join(","),
-                FACE:        [...Array(10).fill("0"), ...Array(16).fill("1"), ...Array(14).fill("0")].join(","),
-                STYLE:       [...Array(20).fill("0"), ...Array(20).fill("1")].join(","),
-                TEXTURE:     [...Array(34).fill("0"), ...Array(6).fill("1")].join(",")
-            }
+            presets: (() => {
+                const map28_40 = [0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27];
+                const base = {
+                    COMPOSITION: [...Array(7).fill("1"), ...Array(21).fill("0")],
+                    FACE:        [...Array(7).fill("0"), ...Array(11).fill("1"), ...Array(10).fill("0")],
+                    STYLE:       [...Array(14).fill("0"), ...Array(14).fill("1")],
+                    TEXTURE:     [...Array(24).fill("0"), ...Array(4).fill("1")]
+                };
+                const out = {};
+                for (const [k, arr] of Object.entries(base)) {
+                    out[k] = map28_40.map(idx => arr[idx]).join(",");
+                }
+                return out;
+            })()
         },
         anima52: {
             label: "Anima 3.8B (52)",
             count: 52,
             names: Array.from({length: 52}, (_, i) => `B${String(i).padStart(2, '0')}`),
-            presets: {
-                COMPOSITION: [...Array(13).fill("1"), ...Array(39).fill("0")].join(","),
-                FACE:        [...Array(13).fill("0"), ...Array(21).fill("1"), ...Array(18).fill("0")].join(","),
-                STYLE:       [...Array(26).fill("0"), ...Array(26).fill("1")].join(","),
-                TEXTURE:     [...Array(44).fill("0"), ...Array(8).fill("1")].join(",")
-            }
+            presets: (() => {
+                const map28_52 = [0, 1, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 7, 7, 7, 8, 9, 9, 9, 10, 11, 11, 11, 12, 13, 14, 14, 14, 15, 16, 16, 16, 17, 18, 18, 18, 19, 20, 20, 20, 21, 22, 22, 22, 23, 24, 24, 24, 25, 26, 27];
+                const base = {
+                    COMPOSITION: [...Array(7).fill("1"), ...Array(21).fill("0")],
+                    FACE:        [...Array(7).fill("0"), ...Array(11).fill("1"), ...Array(10).fill("0")],
+                    STYLE:       [...Array(14).fill("0"), ...Array(14).fill("1")],
+                    TEXTURE:     [...Array(24).fill("0"), ...Array(4).fill("1")]
+                };
+                const out = {};
+                for (const [k, arr] of Object.entries(base)) {
+                    out[k] = map28_52.map(idx => arr[idx]).join(",");
+                }
+                return out;
+            })()
         },
         wan21_14b: {
             label: "Wan 2.1-14B (40)",

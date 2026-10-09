@@ -154,10 +154,6 @@
     background: #ffffff;
 }
 
-.lbw-custom-badge {
-    /* Style matching built-in preset badges */
-}
-
 .lbw-manage-presets-panel {
     background: rgba(0, 0, 0, 0.2);
     border: 1px solid var(--border-color-primary, #374151);
