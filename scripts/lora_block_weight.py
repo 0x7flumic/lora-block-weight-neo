@@ -76,6 +76,8 @@ _RE_BLOCKS = re.compile(r"blocks[._](\d+)[._]")
 # Explicitly match DiT transformer blocks while excluding LLM adapter and text encoder blocks
 _RE_DIT_BLOCKS = re.compile(r"(?<!llm_adapter\.)(?<!text_encoders\.)(?<!text_conditioner\.)\bblocks[._](\d+)[._]")
 
+_RE_MOSS_LAYERS = re.compile(r"(?:transformer[._]|diffusion_model[._])?layers[._](\d+)[._]")
+
 
 # Canonical Anima block mappings from SD WebUI Neo backend/nn/anima.py
 ANIMA_BLOCK_MAPPINGS: Dict[tuple, List[int]] = {
@@ -390,6 +392,36 @@ class QwenImageProfile(ArchitectureProfile):
         return None
 
 
+# MOSS-Image (42 blocks default single-stream DiT)
+MOSS_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 11 + ["0"] * 31),
+    "FACE":        ",".join(["0"] * 10 + ["1"] * 16 + ["0"] * 16),
+    "STYLE":       ",".join(["0"] * 21 + ["1"] * 21),
+    "TEXTURE":     ",".join(["0"] * 34 + ["1"] * 8),
+}
+
+class MossImageProfile(ArchitectureProfile):
+    def __init__(self, block_count=42):
+        super().__init__(
+            name="moss_image",
+            display_name="MOSS-Image",
+            block_count=block_count,
+            block_names={f"B{i:02d}": i for i in range(block_count)},
+            presets=dict(MOSS_PRESETS),
+            key_patterns=[_RE_MOSS_LAYERS]
+        )
+    def get_block_index(self, key: str) -> Optional[int]:
+        m = _RE_MOSS_LAYERS.search(key)
+        if m:
+            return int(m.group(1))
+        m_blk = _RE_BLOCKS.search(key)
+        if m_blk:
+            return int(m_blk.group(1))
+        if any(x in key for x in ("patch_embedding", "text_embedder", "time_embed", "norm_out", "proj_out")):
+            return 0
+        return None
+
+
 PROFILE_REGISTRY: Dict[str, ArchitectureProfile] = {
     "sd15": SDXLProfile(),
     "sdxl": SDXLProfile(),
@@ -402,6 +434,8 @@ PROFILE_REGISTRY: Dict[str, ArchitectureProfile] = {
     "wan21_14b": WanProfile(40),
     "wan21_13b": WanProfile(30),
     "qwen_image": QwenImageProfile(60),
+    "moss_image": MossImageProfile(42),
+    "moss": MossImageProfile(42),
 }
 
 
@@ -446,6 +480,12 @@ def _load_user_presets():
                         PROFILE_REGISTRY["wan21_14b"].presets.update(safe_wan)
                     if "wan21_13b" in PROFILE_REGISTRY:
                         PROFILE_REGISTRY["wan21_13b"].presets.update(safe_wan)
+                if "moss" in data or "moss_image" in data:
+                    moss_data = data.get("moss_image") or data.get("moss")
+                    if isinstance(moss_data, dict):
+                        safe_moss = {pk: pv for pk, pv in moss_data.items() if pk.upper() not in {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}}
+                        if "moss_image" in PROFILE_REGISTRY:
+                            PROFILE_REGISTRY["moss_image"].presets.update(safe_moss)
         except Exception as e:
             logger.error(f"[LBW] Failed to load user presets: {e}")
 
@@ -501,7 +541,21 @@ def detect_model_profile(patch_keys) -> ArchitectureProfile:
         num_blocks = qwen_max + 1
         return QwenImageProfile(num_blocks)
 
-    # 4. Wan 2.1 vs Anima detection
+    # 4. MOSS-Image detection
+    moss_max = -1
+    has_moss = False
+    for k in keys_set:
+        m = _RE_MOSS_LAYERS.search(k)
+        if m:
+            moss_max = max(moss_max, int(m.group(1)))
+            has_moss = True
+        elif "moss" in k.lower():
+            has_moss = True
+    if has_moss:
+        num_blocks = moss_max + 1 if moss_max != -1 else 42
+        return MossImageProfile(num_blocks) if num_blocks != 42 else PROFILE_REGISTRY["moss_image"]
+
+    # 5. Wan 2.1 vs Anima detection
     is_wan = any("patch_embedding" in k or "time_projection" in k or "head." in k or "wan" in k.lower() for k in keys_set)
     is_anima = any("adaln_modulation" in k or "llm_adapter" in k or "qwen" in k.lower() or "anima" in k.lower() for k in keys_set)
     block_max = -1
@@ -516,6 +570,8 @@ def detect_model_profile(patch_keys) -> ArchitectureProfile:
 
     if block_max != -1:
         num_blocks = block_max + 1
+        if num_blocks == 42 and not is_anima and not is_wan:
+            return PROFILE_REGISTRY["moss_image"]
         if num_blocks == 40 and not is_anima:
             # Default 40-block DiT without Anima markers to Wan 14B
             return PROFILE_REGISTRY["wan21_14b"]
@@ -652,12 +708,17 @@ def detect_lora_arch_by_name(name: str) -> Optional[ArchitectureProfile]:
     if not keys and not meta:
         return None
 
-    # Check explicit metadata hints (e.g. ss_base_model_version: anima)
+    # Check explicit metadata hints (e.g. ss_base_model_version: anima, moss)
     meta_arch = str(meta.get("ss_base_model_version", "")).lower()
     modelspec_arch = str(meta.get("modelspec.architecture", "")).lower()
     is_meta_anima = "anima" in meta_arch or "anima" in modelspec_arch
+    is_meta_moss = "moss" in meta_arch or "moss" in modelspec_arch
 
     profile = detect_model_profile(keys)
+
+    # If keys detection was ambiguous or defaulted to SDXL but metadata explicitly declares moss
+    if (profile is None or profile.name == "sdxl") and is_meta_moss:
+        profile = PROFILE_REGISTRY["moss_image"]
 
     # If keys detection was ambiguous or defaulted to SDXL but metadata explicitly declares anima
     if (profile is None or profile.name == "sdxl") and is_meta_anima:
@@ -1086,6 +1147,11 @@ def _delete_preset_internal(prof_key: str, name: str) -> bool:
             for k in keys_to_del:
                 del data["wan"][k]
                 removed = True
+        if prof_key in ("moss_image", "moss") and "moss" in data:
+            keys_to_del = [k for k in data["moss"] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data["moss"][k]
+                removed = True
             
         if removed:
             dir_name = os.path.dirname(USER_PRESETS_FILE)
@@ -1102,6 +1168,8 @@ def _delete_preset_internal(prof_key: str, name: str) -> bool:
             keys_to_clean.extend(["wan21_14b", "wan21_13b"])
         elif prof_key in ("sdxl", "sd15"):
             keys_to_clean.extend(["sdxl", "sd15"])
+        elif prof_key in ("moss_image", "moss"):
+            keys_to_clean.extend(["moss_image", "moss"])
 
         for k in set(keys_to_clean):
             if k in PROFILE_REGISTRY:
@@ -1122,7 +1190,9 @@ def _normalize_arch_key(arch: str) -> str:
         return "anima28"
     if arch in ("flux", "flux1"):
         return "flux1"
-    if arch in ("anima40", "anima52", "flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
+    if arch in ("moss", "moss_image", "moss-image"):
+        return "moss_image"
+    if arch in ("anima40", "anima52", "flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl", "moss_image"):
         return arch
     return "sdxl"
 

@@ -147,6 +147,17 @@
                 STYLE:       [...Array(30).fill("0"), ...Array(30).fill("1")].join(","),
                 TEXTURE:     [...Array(50).fill("0"), ...Array(10).fill("1")].join(",")
             }
+        },
+        moss_image: {
+            label: "MOSS-Image (42)",
+            count: 42,
+            names: Array.from({length: 42}, (_, i) => `B${String(i).padStart(2, '0')}`),
+            presets: {
+                COMPOSITION: [...Array(11).fill("1"), ...Array(31).fill("0")].join(","),
+                FACE:        [...Array(10).fill("0"), ...Array(16).fill("1"), ...Array(16).fill("0")].join(","),
+                STYLE:       [...Array(21).fill("0"), ...Array(21).fill("1")].join(","),
+                TEXTURE:     [...Array(34).fill("0"), ...Array(8).fill("1")].join(",")
+            }
         }
     };
 

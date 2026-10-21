@@ -1,6 +1,6 @@
 # LoRA Block Weight Neo
 
-Dynamic, per-block weight control for LoRA models in **Stable Diffusion WebUI Forge (Neo)** across **SD 1.5, SDXL, Flux.1, Flux.2-Klein, Anima, Wan 2.1, and Qwen-Image** architectures.
+Dynamic, per-block weight control for LoRA models in **Stable Diffusion WebUI Forge (Neo)** across **SD 1.5, SDXL, Flux.1, Flux.2-Klein, Anima, Wan 2.1, Qwen-Image, and MOSS-Image** architectures.
 
 ---
 
@@ -38,6 +38,7 @@ Dynamic, per-block weight control for LoRA models in **Stable Diffusion WebUI Fo
 | **Anima 3.8B** | **52** | DiT stack `B00`–`B51` *(LLM adapter protected; 28→52 canonical host mapping)* |
 | **Wan 2.1 14B / 1.3B** | **40 / 30** | Video DiT stack `B00`–`B39` (14B) / `B00`–`B29` (1.3B) |
 | **Qwen-Image** | **60** | Transformer DiT stack `B00`–`B59` |
+| **MOSS-Image 5B** | **42** | Single-stream DiT stack `B00`–`B41` (`layers.0`–`layers.41`) |
 
 ---
 
@@ -80,4 +81,5 @@ Target a single layer (one-hot activation):
 ```text
 <lora:my_lora:1.0:lbw=M00>
 <lora:anima_lora:1.0:lbw=B14>
+<lora:moss_lora:1.0:lbw=B22>
 ```
